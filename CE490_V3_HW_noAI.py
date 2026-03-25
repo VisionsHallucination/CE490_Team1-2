@@ -44,7 +44,9 @@ DROPOFF_STACK = [
 ]
 
 HUB_XY     = np.array([-1.055, -0.93]) 
-
+TAXI_HUB_POS = [-1.319, -0.485, 0.006]
+calibrationPose = [0, 2, -np.pi/2]   # or [0,0,-np.pi/2] depending on square
+calComm = True
 
 
 # ===========================
@@ -90,7 +92,7 @@ NODE_SEQUENCE = [
     10,
 ]
 
-V_REF = 1.0  # Locked cruise speed
+V_REF = .5  # Locked cruise speed
 CONTROLLER_RATE = 100  # 100Hz loop
 START_DELAY = 2.0  # Time for EKF to stabilize before moving
 
@@ -111,8 +113,8 @@ PATH_SAMPLE_STEP = 10  # plot every Nth waypoint
 PATH_Z = 0.02
 
 # Initial Pose (Matches Setup_Real_Scenario default)
-INITIAL_POS = [-1.205, -0.83, 0.005]
-INITIAL_ROT = [0, 0, -44.7]
+INITIAL_POS = [0, 0, 0]
+#INITIAL_ROT = [0, 0, -44.7]
 
 KILL_PROGRAM = False
 
@@ -124,8 +126,8 @@ camCorrHist = deque(maxlen=300)
 
 destHoldTime = 1 # How long to pause at destination
 vStopped = .1 # What speed counts as vehicle stopped
-destThd = .25 # How far can the car be while concidered at the stop
-REANCHOR_LOOKAHEAD_WPS = 120
+destThd = .40 # How far can the car be while concidered at the stop
+REANCHOR_LOOKAHEAD_WPS = 40
 def sig_handler(*args):
     global KILL_PROGRAM
     KILL_PROGRAM = True
@@ -192,8 +194,8 @@ def pop_stack(stack):
 class SpeedController:
     """Locked speed controller with anti-surge logic."""
 
-    def __init__(self, kp=0.04, ki=0.15):
-        self.maxThrottle = 1.0
+    def __init__(self, kp=0.1, ki=1):
+        self.maxThrottle = .3
         self.kp = kp
         self.ki = ki
         self.ei = 0
@@ -209,7 +211,7 @@ class SteeringController:
     """Dampened Stanley Controller."""
     # input params: waypoints, proportion gain,
 
-    def __init__(self, waypoints, k=0.6, cyclic=False):
+    def __init__(self, waypoints, k=1, cyclic=False):
         self.maxSteeringAngle = np.pi / 6
         self.wp = waypoints
         self.N = len(waypoints[0, :])
@@ -345,124 +347,6 @@ def dijkstra(roadmap, start_idx, goal_idx):
 
     return path
 
-# Task pulls camera data, marks yellow/white pixes, then uses those to determine lane center
-# Lane center determined by pixels on left to right closest to lane center
-# V1.0
-# Changelog:
-# 2/23/26: Push current code, does not work 
-def lane_offset_thread(camera, sleep_s=0.01):
-    global KILL_PROGRAM, offsets, camCorrFct
-
-    # HSV thresholds (tweak if needed)
-    YELLOW_LO = (10, 60, 60)
-    YELLOW_HI = (50, 255, 255)
-    WHITE_LO  = (0, 0, 200)
-    WHITE_HI  = (180, 45, 255)
-
-    kernel = np.ones((5, 5), np.uint8)
-
-    #Thread main                                    
-    while not KILL_PROGRAM:
-        # Get Frame
-        camera.readAll()
-        rawFrame = camera.csiLeft.imageData
-
-        if rawFrame.ndim == 2:
-            rawFrame = cv2.cvtColor(rawFrame, cv2.COLOR_GRAY2BGR)
-        if rawFrame.shape[-1] == 4:
-            rawFrame = rawFrame[:, :, :3]                
-
-        roi = rawFrame[:, :]
-
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)                                                
-        
-        # Create mask
-        yellow_mask = cv2.inRange(hsv, YELLOW_LO, YELLOW_HI)
-        white_mask  = cv2.inRange(hsv, WHITE_LO,  WHITE_HI)
-        mask = cv2.bitwise_or(yellow_mask, white_mask)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-        # Get mask height     
-        H, W = mask.shape 
-        #Grab lower half of frame
-        y0 = int(H * 0.50) 
-        roi = mask[y0:, :] 
-        hR, wR = roi.shape 
-        
-        # Define a trapezoid to morph ROI
-        src = np.float32([
-            [wR * 0.2, hR * 0.55],  # top-left
-            [wR * 0.8, hR * 0.55],  # top-right
-            [wR * 1, hR * 0.98],  # bottom-right
-            [wR * 0, hR * 0.98],  # bottom-left
-        ])
-
-        dst = np.float32([
-            [wR - 1, hR - 1],
-            [0,      hR - 1],
-            [0,      0],
-            [wR - 1, 0],
-        ])
-        # Apply Transform
-        M = cv2.getPerspectiveTransform(src, dst)
-        procImg = cv2.warpPerspective(roi, M, (wR, hR), flags=cv2.INTER_NEAREST)
-        procImg = cv2.rotate(procImg, cv2.ROTATE_180)
-        procImg = cv2.morphologyEx(procImg, cv2.MORPH_OPEN, np.ones((3,3), np.uint8)) 
-        
-        #Grab center, and search region
-        mid = wR // 2
-        third = wR // 4
-        leftROI = procImg[:, :third]   
-
-        closestX = []
-
-        #Find rightmost signals for each row
-        for row in (leftROI > 0):
-            idx = np.flatnonzero(row)
-            if idx.size == 0:
-                continue
-            
-            gaps = np.where(np.diff(idx) > 10)[0] 
-            if gaps.size:
-                closestX.append(int(idx[gaps[0]]))
-            else:
-                closestX.append(int(idx[-1]))
-
-        #Reject if lack 'hits' in frame
-        if len(closestX) < 30:
-            #offsets.clear()
-            #camCorrFct = 0.0
-            time.sleep(sleep_s)
-            continue
-        
-        # lane marker is mean of closest edge location
-        LaneX = float(np.median(closestX))
-        offset = (mid - LaneX)               
-
-        # Reject inplausable data
-        if offset <= 0 or offset >= mid:
-            #offsets.clear()
-            #camCorrFct = 0.0
-            time.sleep(sleep_s)
-            continue
-    
-        # Update offset buffer
-        offsets.append(offset) 
-        if len(offsets) > offsetFrameBuf:
-            offsets.pop(0)
-
-        #Find short term average offset, to find tracking error
-        avgOffset = sum(offsets) / len(offsets)
-        errX = avgOffset - desiredCamTrack
-
-        Kcam = 1 #Error gain
-        #Calculate correction Factor to pass to steering controller
-        camCorrFct = np.clip(Kcam * (errX / mid), -0.5, 0.5)
-        time.sleep(sleep_s)
-
-
-
 # ===========================
 # 3.4 CAMERA / LANE DEBUG 
 # ===========================
@@ -493,17 +377,27 @@ def camera_thread_worker(camera):
 # ===========================
 Kill_Thread = False
 
-
 # ===========================
 # 4. MAIN
 # ===========================
 def main():
-    os.system("cls")
+    os.system("clear")
     print("Connecting to QLabs...")
+
+    roadmap = CustomRoadMap()
+
+    start_node = NODE_SEQUENCE[0]
+    initialPose = roadmap.nodes[start_node].pose[:2, 0]
+    initialPose = np.array([
+        initialPose[0],
+        initialPose[1],
+        calibrationPose[2]   # <-- match heading
+    ])
+
     # 3. Setup Hardware & Pathing (Simpler main.py approach)
     qcar = QCar(readMode=1, frequency=CONTROLLER_RATE)
-    gps = QCarGPS(initialPose=INITIAL_POS)
-    ekf = QCarEKF(x_0=INITIAL_POS)
+    ekf = QCarEKF(x_0=initialPose)
+    gps = QCarGPS(initialPose=calibrationPose, calibrate=calComm)
 
     roadmap = CustomRoadMap()
     # ==========================================
@@ -556,12 +450,11 @@ def main():
         return
 
     speed_ctrl = SpeedController()
-    steer_ctrl = SteeringController(waypoints=waypointSequence, cyclic=True)
+    steer_ctrl = SteeringController(waypoints=waypointSequence, cyclic=False)
     # Example of creating vehSTate instance
     curState = VehState()
 
     print(f"Environment Ready. Following Nodes: {NODE_SEQUENCE}")
-    pathForState = -1
     # 4. Main Control Loop
     with qcar, gps:
         t0 = time.time()
@@ -570,6 +463,9 @@ def main():
         atWaypoint = False
         active_stop_xy = None
         lastStr = 0
+        launch_xy = None
+        delay_reanchored = False
+        min_dist_seen = float('inf')  # track closest approach to goal
         while not KILL_PROGRAM:
             
             t = time.time() - t0
@@ -592,9 +488,18 @@ def main():
             if t < START_DELAY:
                 qcar.write(0, 0)
                 time.sleep(dt)
+                #print(f"DELAY t={t:.2f}")
                 continue
 
             xy = np.array([x, y])
+
+            # One-time re-anchor after START_DELAY so wpi isn't stuck at 0
+            if not delay_reanchored:
+                wp_xy = steer_ctrl.wp[:2, :].T
+                closest_i = int(np.argmin(np.linalg.norm(wp_xy - xy, axis=1)))
+                steer_ctrl.wpi = min(closest_i, steer_ctrl.N - 2)
+                delay_reanchored = True
+                print(f"[INFO] Post-delay re-anchor wpi={steer_ctrl.wpi} pos=({x:.3f},{y:.3f}) th={th:.3f}")
 
             if curState.state == VehState.IDLE:
                 goal_xy = peek_stack(PICKUP_STACK) if len(PICKUP_STACK) > 0 else HUB_XY
@@ -605,12 +510,20 @@ def main():
             elif curState.state == VehState.DROPOFF:
                 goal_xy = HUB_XY
 
-            if pathForState != curState.state:
+            if launch_xy is None:
+                launch_xy = xy.copy() 
+            moved_enough = (np.linalg.norm(xy - launch_xy) > 0.10) or (abs(v) > 0.02)
+
+            if pathForState is None:
+                allow_replan = True
+            else:
+                allow_replan = moved_enough
+
+            if allow_replan and pathForState != curState.state:
                 start_n = min(
                     range(len(roadmap.nodes)),
                     key=lambda i: np.linalg.norm(roadmap.nodes[i].pose[:2, 0] - xy),
                 )
-
                 goal_n = min(
                     range(len(roadmap.nodes)),
                     key=lambda i: np.linalg.norm(roadmap.nodes[i].pose[:2, 0] - goal_xy),
@@ -618,29 +531,52 @@ def main():
 
                 node_path = dijkstra(roadmap, start_n, goal_n)
 
-                if node_path is not None:
+                if node_path is not None :
                     newWaypointSequence = roadmap.generate_path(node_path)
-
-                    # append raw target so final path endpoint matches requested stop
-                    goal_col = np.array(goal_xy, dtype=float).reshape(2, 1)
-                    newWaypointSequence = np.hstack([newWaypointSequence, goal_col])
-
                     steer_ctrl.cyclic = False
                     steer_ctrl.newWaypoint(newWaypointSequence)
-
+                    wp_xy = newWaypointSequence[:2, :].T
+                    closest_i = int(np.argmin(np.linalg.norm(wp_xy - xy, axis=1)))
+                    steer_ctrl.wpi = min(closest_i, steer_ctrl.N - 2)
+                        
                     active_stop_xy = newWaypointSequence[:2, -1].copy()
-
-                    print(f"[INFO] Replanned state={curState.state} start_n={start_n} goal_n={goal_n} stop={active_stop_xy}")
+                       
+                    print(f"[INFO] Replanned state={curState.state} start_n={start_n} goal_n={goal_n} path={node_path} N_wp={steer_ctrl.N} stop=({active_stop_xy[0]:.3f},{active_stop_xy[1]:.3f}) goal=({goal_xy[0]:.3f},{goal_xy[1]:.3f})")
+                        
                 else:
                     print(f"[WARN] No path found to goal {goal_xy}")
                     active_stop_xy = goal_xy.copy()
-
+                    
                 pathForState = curState.state
+                min_dist_seen = float('inf')  # reset for new goal
 
             # Stop gating at pickup/dropoff/hub
-            dist = float(np.linalg.norm(goal_xy - xy))
-            if dist < destThd:
-                atWaypoint = True
+            stop_target = active_stop_xy if active_stop_xy is not None else goal_xy
+            dist = float(np.linalg.norm(stop_target - xy))
+
+            # Track closest approach - trigger stop if we were close and are now moving away
+            if dist < min_dist_seen:
+                min_dist_seen = dist
+
+            # Trigger atWaypoint if:
+            #   (a) we're within destThd of the goal, OR
+            #   (b) we got within destThd at some point and dist is now increasing (drove past it)
+            near_path_end = (not steer_ctrl.cyclic) and (steer_ctrl.wpi >= steer_ctrl.N - 3)
+
+            if not atWaypoint:
+                if dist < destThd:
+                    atWaypoint = True
+                    print(f"[INFO] atWaypoint triggered (dist): dist={dist:.3f} stop=({stop_target[0]:.2f},{stop_target[1]:.2f})")
+                elif near_path_end and min_dist_seen < 1.5:
+                    # Reached end of road path and were reasonably close to stop point
+                    atWaypoint = True
+                    print(f"[INFO] atWaypoint triggered (end of path): wpi={steer_ctrl.wpi}/{steer_ctrl.N} min_dist={min_dist_seen:.3f}")
+                elif min_dist_seen < destThd and dist > min_dist_seen + 0.10:
+                    # Were close enough but drove past
+                    atWaypoint = True
+                    print(f"[INFO] atWaypoint triggered (drove past): min_dist={min_dist_seen:.3f} dist={dist:.3f}")
+            
+            
             
             if atWaypoint:
                 lastStr = lastStr * .95
@@ -678,10 +614,16 @@ def main():
                         pathForState = None
 
                     atWaypoint = False
+                    launch_xy = xy.copy()
+                    min_dist_seen = float('inf')
+                    print(f"[INFO] State transition complete, new state={curState.state}")
+
 
             else:
                 thr = speed_ctrl.update(v, V_REF, dt)
                 str_ang = steer_ctrl.update(p_front, th, v)
+
+                print(f"DRIVE t={t:.2f} v={v:.3f} thr={thr:.3f} str={str_ang:.3f} dist={dist:.3f} min={min_dist_seen:.3f} pos=({x:.2f},{y:.2f}) stop=({stop_target[0]:.2f},{stop_target[1]:.2f}) wpi={steer_ctrl.wpi}/{steer_ctrl.N}")
                 qcar.write(thr, str_ang)
                 lastStr = str_ang
 
